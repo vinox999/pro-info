@@ -86,7 +86,7 @@ def Get_player_information(uid, token):
                 "status": "success",
                 "uid": uid,
                 "data": {
-                    "hex": hex_response[:500] + "..." if len(hex_response) > 500 else hex_response,
+                    "hex_preview": hex_response[:300] + "..." if len(hex_response) > 300 else hex_response,
                     "length": len(response.content)
                 }
             }
@@ -102,9 +102,26 @@ def Get_player_information(uid, token):
 
 @app.route('/info', methods=['GET'])
 def get_info():
+    # طباعة كل المعاملات للتصحيح
+    print(f"Args: {request.args}")
+    print(f"Full path: {request.full_path}")
+    
     uid = request.args.get('uid')
+    
+    # محاولة بديلة: قراءة من query_string مباشرة
     if not uid:
-        return jsonify({"error": "Missing uid", "usage": "/info?uid=ID"}), 400
+        from urllib.parse import parse_qs
+        query_string = request.query_string.decode('utf-8') if request.query_string else ''
+        parsed = parse_qs(query_string)
+        uid = parsed.get('uid', [None])[0]
+    
+    if not uid:
+        return jsonify({
+            "error": "Missing uid", 
+            "usage": "/info?uid=ID",
+            "debug_received_args": dict(request.args),
+            "debug_full_path": request.full_path
+        }), 400
     
     token = get_jwt(INFO_TOKENS[0][0], INFO_TOKENS[0][1])
     if not token:
@@ -113,11 +130,17 @@ def get_info():
     return jsonify(Get_player_information(uid, token))
 
 @app.route('/', methods=['GET'])
+@app.route('/api', methods=['GET'])
 def home():
-    return jsonify({"endpoint": "/info?uid=ID"})
+    return jsonify({
+        "service": "FreeFire Info API",
+        "endpoint": "/info?uid=PLAYER_ID",
+        "example": "/info?uid=3320446299",
+        "note": "Make sure to include ?uid= in the URL"
+    })
 
 # لـ Vercel
 app = app
 
 if __name__ == '__main__':
-    app.run()
+    app.run(debug=True, port=5000)
