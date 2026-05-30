@@ -1,7 +1,8 @@
 from flask import Flask, request, jsonify
 import requests, binascii, re
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
+from Crypto.Util.Padding import pad, unpad
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -61,6 +62,71 @@ def encrypt_api(plain_text):
     cipher_text = cipher.encrypt(pad(plain_text, AES.block_size))
     return cipher_text.hex()
 
+def decrypt_api(cipher_text):
+    key = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
+    iv = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    plain_text = unpad(cipher.decrypt(bytes.fromhex(cipher_text)), AES.block_size)
+    return plain_text.hex()
+
+def parse_protobuf(hex_string):
+    """فك protobuf واستخراج البيانات"""
+    result = {}
+    i = 0
+    hex_len = len(hex_string)
+    
+    while i < hex_len - 2:
+        try:
+            # قراءة field number و wire type
+            first_byte = int(hex_string[i:i+2], 16)
+            field_num = first_byte >> 3
+            wire_type = first_byte & 0x07
+            i += 2
+            
+            if wire_type == 0:  # Varint
+                value = 0
+                shift = 0
+                while i < hex_len:
+                    byte = int(hex_string[i:i+2], 16)
+                    i += 2
+                    value |= (byte & 0x7F) << shift
+                    shift += 7
+                    if (byte & 0x80) == 0:
+                        break
+                result[field_num] = value
+                
+            elif wire_type == 2:  # Length-delimited (string أو embedded message)
+                # قراءة الطول
+                length = 0
+                shift = 0
+                while i < hex_len:
+                    byte = int(hex_string[i:i+2], 16)
+                    i += 2
+                    length |= (byte & 0x7F) << shift
+                    shift += 7
+                    if (byte & 0x80) == 0:
+                        break
+                
+                # قراءة البيانات
+                if i + length * 2 <= hex_len:
+                    data_hex = hex_string[i:i+length*2]
+                    i += length * 2
+                    
+                    # محاولة فك كنص UTF-8
+                    try:
+                        text = bytes.fromhex(data_hex).decode('utf-8')
+                        if text.isprintable() and len(text) > 0:
+                            result[field_num] = text
+                        else:
+                            # يمكن أن تكون embedded message
+                            result[field_num] = parse_protobuf(data_hex)
+                    except:
+                        result[field_num] = data_hex
+        except Exception as e:
+            break
+    
+    return result
+
 def Get_player_information(uid, token):
     try:
         encrypted_id = Encrypt_ID(uid)
@@ -82,13 +148,49 @@ def Get_player_information(uid, token):
         if response.status_code == 200:
             hex_response = binascii.hexlify(response.content).decode('utf-8')
             
+            # فك protobuf
+            parsed_data = parse_protobuf(hex_response)
+            
+            # استخراج البيانات المهمة
+            basic_info = {}
+            try:
+                # محاولة استخراج الحقول المعروفة
+                if 1 in parsed_data and isinstance(parsed_data[1], dict):
+                    player_data = parsed_data[1]
+                    basic_info['accountId'] = uid
+                    basic_info['nickname'] = player_data.get(3, 'Unknown')
+                    basic_info['level'] = player_data.get(6, 0)
+                    basic_info['liked'] = player_data.get(21, 0)
+                    basic_info['exp'] = player_data.get(7, 0)
+                    
+                    if 44 in player_data:
+                        create_time = player_data[44]
+                        basic_info['createAt'] = str(create_time)
+                        basic_info['createDate'] = datetime.fromtimestamp(create_time).strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    if 5 in player_data:
+                        basic_info['region'] = player_data[5]
+                    
+                    if 9 in player_data and isinstance(player_data[9], dict):
+                        basic_info['signature'] = player_data[9].get(9, '')
+                
+                # معلومات العشيرة
+                if 6 in parsed_data and isinstance(parsed_data[6], dict):
+                    clan_data = parsed_data[6]
+                    basic_info['clan'] = {
+                        'clanId': clan_data.get(1, ''),
+                        'clanName': clan_data.get(2, ''),
+                        'clanLevel': clan_data.get(4, 0),
+                        'membersCount': clan_data.get(6, 0)
+                    }
+            except Exception as e:
+                basic_info['parse_error'] = str(e)
+            
             result = {
                 "status": "success",
                 "uid": uid,
-                "data": {
-                    "hex_preview": hex_response[:300] + "..." if len(hex_response) > 300 else hex_response,
-                    "length": len(response.content)
-                }
+                "basicInfo": basic_info,
+                "raw_parsed": parsed_data if len(str(parsed_data)) < 500 else "Too large"
             }
             return result
         else:
@@ -102,45 +204,25 @@ def Get_player_information(uid, token):
 
 @app.route('/info', methods=['GET'])
 def get_info():
-    # طباعة كل المعاملات للتصحيح
-    print(f"Args: {request.args}")
-    print(f"Full path: {request.full_path}")
-    
     uid = request.args.get('uid')
     
-    # محاولة بديلة: قراءة من query_string مباشرة
     if not uid:
-        from urllib.parse import parse_qs
-        query_string = request.query_string.decode('utf-8') if request.query_string else ''
-        parsed = parse_qs(query_string)
-        uid = parsed.get('uid', [None])[0]
-    
-    if not uid:
-        return jsonify({
-            "error": "Missing uid", 
-            "usage": "/info?uid=ID",
-            "debug_received_args": dict(request.args),
-            "debug_full_path": request.full_path
-        }), 400
+        return jsonify({"error": "Missing uid", "usage": "/info?uid=ID"}), 400
     
     token = get_jwt(INFO_TOKENS[0][0], INFO_TOKENS[0][1])
     if not token:
         return jsonify({"error": "Token failed"}), 500
     
-    return jsonify(Get_player_information(uid, token))
+    result = Get_player_information(uid, token)
+    return jsonify(result)
 
 @app.route('/', methods=['GET'])
-@app.route('/api', methods=['GET'])
 def home():
     return jsonify({
         "service": "FreeFire Info API",
         "endpoint": "/info?uid=PLAYER_ID",
-        "example": "/info?uid=3320446299",
-        "note": "Make sure to include ?uid= in the URL"
+        "example": "/info?uid=3320446299"
     })
-
-# لـ Vercel
-app = app
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
